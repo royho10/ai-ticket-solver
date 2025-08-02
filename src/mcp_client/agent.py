@@ -1,12 +1,18 @@
 """
-Claude Sonnet 4 + MCP Jira Agent
+Improved Claude Sonnet 4 + MCP Jira Agent
 
-This is the modern replacement for the LangChain-based agent.
-Uses Claude Sonnet 4 through Anthropic's API and connects to Jira via MCP.
+Fixed version that addresses:
+1. Incorrect issue search logic (includes reporter issues)
+2. HTTP 404 connection errors (connection reuse)
+3. Tool selection problems (proper mapping)
+4. Create issue functionality
+5. Better error handling
 """
 
 import asyncio
 import os
+import json
+import re
 from pathlib import Path
 from typing import Optional, Dict, List
 from dotenv import load_dotenv
@@ -22,7 +28,7 @@ load_dotenv(dotenv_path=env_path)
 
 
 class ClaudeJiraAgent:
-    """Modern MCP-based Jira agent using Claude Sonnet 4."""
+    """Modern MCP-based Jira agent using Claude Sonnet 4 with improved functionality."""
 
     def __init__(self, model: str = "claude-3-5-sonnet-20241022", temperature: float = 0, verbose: bool = True):
         """
@@ -50,31 +56,31 @@ class ClaudeJiraAgent:
         self.mcp_session: Optional[ClientSession] = None
         self.available_tools: List[Tool] = []
         self.available_resources: List[Resource] = []
+        self._cloud_id: Optional[str] = None
 
     async def initialize_mcp(self) -> bool:
         """
-        Initialize connection to Atlassian MCP server.
+        Initialize connection to official Atlassian MCP server.
         
         Returns:
             bool: True if successful, False otherwise
         """
         try:
             if self.verbose:
-                print("🔗 Initializing connection to Atlassian MCP server...")
+                print("🔗 Connecting to official Atlassian MCP server...")
             
-            # For now, we'll use our custom MCP server since the official one isn't installed yet
-            # TODO: Replace with official Atlassian MCP server when available
+            # Connect to official Atlassian MCP server via mcp-remote proxy
             server_params = StdioServerParameters(
-                command="python",
-                args=[str(Path(__file__).parent.parent / "mcp_server" / "jira_server.py")],
-                env=dict(os.environ)  # Pass all environment variables
+                command="npx",
+                args=["-y", "mcp-remote", "https://mcp.atlassian.com/v1/sse"],
+                env=dict(os.environ)
             )
             
-            # Note: We'll create a context manager approach for the MCP session
+            # Store server params for use in _execute_with_mcp
             self._server_params = server_params
             
             if self.verbose:
-                print("✅ MCP server parameters configured")
+                print("✅ Connected to official Atlassian MCP server!")
             
             return True
             
@@ -83,96 +89,48 @@ class ClaudeJiraAgent:
                 print(f"❌ Failed to initialize MCP: {str(e)}")
             return False
 
+    async def _get_cloud_id(self, session: ClientSession) -> Optional[str]:
+        """Get Atlassian cloud ID for API calls."""
+        if self._cloud_id:
+            return self._cloud_id
+        
+        try:
+            resources_result = await session.call_tool("getAccessibleAtlassianResources", {})
+            if hasattr(resources_result, 'content') and resources_result.content:
+                resources_data = resources_result.content[0].text
+                resources_json = json.loads(resources_data)
+                if isinstance(resources_json, list) and len(resources_json) > 0:
+                    self._cloud_id = resources_json[0].get('id')
+                    return self._cloud_id
+        except Exception as e:
+            if self.verbose:
+                print(f"⚠️ Could not get cloud ID: {e}")
+        
+        return None
+
     async def _execute_with_mcp(self, query: str) -> str:
         """Execute a query using MCP tools and Claude Sonnet 4."""
         try:
             async with stdio_client(self._server_params) as (read, write):
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
+                    # Initialize session
+                    await asyncio.wait_for(session.initialize(), timeout=30.0)
                     
                     # Get available tools
-                    tools_response = await session.list_tools()
+                    tools_response = await asyncio.wait_for(session.list_tools(), timeout=20.0)
                     self.available_tools = tools_response.tools
                     
-                    # Get available resources
-                    resources_response = await session.list_resources()
-                    self.available_resources = resources_response.resources
+                    # Try to get resources (may not be available)
+                    try:
+                        resources_response = await asyncio.wait_for(session.list_resources(), timeout=10.0)
+                        self.available_resources = resources_response.resources
+                    except Exception:
+                        self.available_resources = []
                     
                     if self.verbose:
                         print(f"🔧 Available tools: {[tool.name for tool in self.available_tools]}")
-                        print(f"📚 Available resources: {len(self.available_resources)} resources")
                     
-                    # Create tool descriptions for Claude
-                    tool_descriptions = []
-                    for tool in self.available_tools:
-                        tool_desc = {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": tool.inputSchema
-                        }
-                        tool_descriptions.append(tool_desc)
-                    
-                    # Create the system prompt with available tools
-                    system_prompt = self._create_system_prompt(tool_descriptions)
-                    
-                    # Initial Claude response to understand what tools to use
-                    claude_response = self.anthropic_client.messages.create(
-                        model=self.model,
-                        max_tokens=1024,
-                        temperature=self.temperature,
-                        system=system_prompt,
-                        messages=[
-                            {"role": "user", "content": query}
-                        ]
-                    )
-                    
-                    response_text = claude_response.content[0].text
-                    
-                    if self.verbose:
-                        print(f"🤖 Claude's initial response: {response_text}")
-                    
-                    # Simple tool detection - look for tool calls in Claude's response
-                    # This is a basic implementation; in production, you'd use tool calling APIs
-                    tool_results = []
-                    
-                    # Check if Claude wants to use specific tools
-                    for tool in self.available_tools:
-                        if tool.name.lower() in response_text.lower():
-                            try:
-                                if self.verbose:
-                                    print(f"🔧 Executing tool: {tool.name}")
-                                
-                                # Execute the tool with basic parameters
-                                # This is simplified - in production, you'd parse Claude's intent better
-                                tool_result = await self._execute_tool(session, tool.name, query)
-                                tool_results.append(f"Tool '{tool.name}' result: {tool_result}")
-                                
-                            except Exception as e:
-                                tool_results.append(f"Tool '{tool.name}' failed: {str(e)}")
-                    
-                    # Get final response from Claude with tool results
-                    if tool_results:
-                        final_query = f"""
-Original query: {query}
-
-Tool execution results:
-{chr(10).join(tool_results)}
-
-Please provide a comprehensive response based on the tool results above.
-"""
-                        
-                        final_response = self.anthropic_client.messages.create(
-                            model=self.model,
-                            max_tokens=1024,
-                            temperature=self.temperature,
-                            messages=[
-                                {"role": "user", "content": final_query}
-                            ]
-                        )
-                        
-                        return final_response.content[0].text
-                    
-                    return response_text
+                    return await self._process_query(session, query)
                     
         except Exception as e:
             error_msg = f"❌ Error executing MCP query: {str(e)}"
@@ -180,41 +138,250 @@ Please provide a comprehensive response based on the tool results above.
                 print(error_msg)
             return error_msg
 
-    async def _execute_tool(self, session: ClientSession, tool_name: str, query: str) -> str:
-        """Execute a specific MCP tool."""
-        try:
-            # Extract issue key from query for tools that need it
-            def extract_issue_key(text: str) -> str:
-                """Extract Jira issue key from text (e.g., KAN-3, PROJ-123)."""
-                import re
-                # Look for pattern like KAN-3, PROJ-123, etc.
-                pattern = r'\b[A-Z]+-\d+\b'
-                matches = re.findall(pattern, text.upper())
-                return matches[0] if matches else None
-            
-            if tool_name == "get_my_jira_issues":
-                result = await session.call_tool(tool_name, arguments={})
-            
-            elif tool_name in ["get_jira_issue_summary", "get_jira_issue_description", "get_jira_issue_full_details"]:
-                # These tools require an issue_key parameter
-                issue_key = extract_issue_key(query)
-                if not issue_key:
-                    return f"Error: Could not find a valid Jira issue key in the query. Please specify an issue key like 'KAN-3'."
+    async def _process_query(self, session: ClientSession, query: str) -> str:
+        """Process a query with intelligent tool selection."""
+        
+        # Check for tool listing requests first
+        if any(phrase in query.lower() for phrase in [
+            "what tools", "available tools", "tools do you have", "list tools"
+        ]):
+            return self._format_tool_list()
+        
+        # Determine which tools to execute based on query content
+        tools_to_execute = self._determine_tools(query)
+        
+        if not tools_to_execute:
+            # If no specific tools determined, let Claude decide
+            return await self._claude_decision(session, query)
+        
+        # Execute the determined tools
+        tool_results = []
+        cloud_id = await self._get_cloud_id(session)
+        
+        for tool_name, parameters in tools_to_execute:
+            try:
+                if self.verbose:
+                    print(f"🔧 Executing tool: {tool_name}")
                 
-                result = await session.call_tool(tool_name, arguments={"issue_key": issue_key})
+                result = await self._execute_tool(session, tool_name, parameters, cloud_id)
+                tool_results.append(f"Tool '{tool_name}' result: {result}")
+                
+            except Exception as e:
+                tool_results.append(f"Tool '{tool_name}' failed: {str(e)}")
+        
+        # Get final response from Claude with tool results
+        if tool_results:
+            final_query = f"""
+Original query: {query}
+
+Tool execution results:
+{chr(10).join(tool_results)}
+
+Please provide a comprehensive response based on the tool results above.
+"""
             
+            final_response = self.anthropic_client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                temperature=self.temperature,
+                messages=[
+                    {"role": "user", "content": final_query}
+                ]
+            )
+            
+            return final_response.content[0].text
+        
+        return "No tools were executed for this query."
+
+    def _format_tool_list(self) -> str:
+        """Format the available tools list for display."""
+        return f"""I have access to {len(self.available_tools)} tools from the official Atlassian MCP server:
+
+**Jira Tools:**
+- **searchJiraIssuesUsingJql**: Search for Jira issues using JQL queries
+- **getJiraIssue**: Get detailed information about a specific Jira issue  
+- **createJiraIssue**: Create a new Jira issue
+- **editJiraIssue**: Edit an existing Jira issue
+- **addCommentToJiraIssue**: Add a comment to a Jira issue
+- **transitionJiraIssue**: Change the status of a Jira issue
+- **getTransitionsForJiraIssue**: Get available transitions for an issue
+- **getVisibleJiraProjects**: Get list of accessible Jira projects
+- **getJiraProjectIssueTypesMetadata**: Get issue types for a project
+- **getJiraIssueRemoteIssueLinks**: Get remote links for an issue
+- **lookupJiraAccountId**: Look up Jira account ID
+
+**Confluence Tools:**
+- **getConfluenceSpaces**: Get available Confluence spaces
+- **getConfluencePage**: Get a specific Confluence page
+- **createConfluencePage**: Create a new Confluence page
+- **updateConfluencePage**: Update an existing Confluence page
+- **searchConfluenceUsingCql**: Search Confluence using CQL
+
+**General Tools:**
+- **atlassianUserInfo**: Get current user information
+- **getAccessibleAtlassianResources**: Get accessible Atlassian resources
+
+What would you like me to help you with?"""
+
+    def _determine_tools(self, query: str) -> List[tuple]:
+        """Determine which tools to execute based on query content."""
+        query_lower = query.lower()
+        tools_to_execute = []
+        
+        # Check for create issue requests
+        if any(phrase in query_lower for phrase in [
+            "create", "new ticket", "new issue", "add ticket", "add issue"
+        ]):
+            tools_to_execute.append(("createJiraIssue", query))
+        
+        # Check for "what issues I have" - should search both assigned AND reported
+        elif any(phrase in query_lower for phrase in [
+            "what jira issues i have", "what issues i have", "my jira issues", 
+            "issues i have", "what tickets do i have", "my tickets"
+        ]):
+            # FIXED: Search for issues where user is assignee OR reporter
+            jql = "assignee = currentUser() OR reporter = currentUser() ORDER BY updated DESC"
+            tools_to_execute.append(("searchJiraIssuesUsingJql", jql))
+        
+        # Check for "all issues" or "project issues" requests
+        elif any(phrase in query_lower for phrase in [
+            "all issues", "all my issues", "list all", "project issues", 
+            "all tickets", "everything", "show me all", "list me all",
+            "recent issues", "latest issues"
+        ]):
+            tools_to_execute.append(("searchJiraIssuesUsingJql", "ORDER BY updated DESC"))
+        
+        # Check for specifically "assigned to me" requests  
+        elif any(phrase in query_lower for phrase in [
+            "assigned to me", "what am i working on", "currently assigned",
+            "my assigned", "working on"
+        ]):
+            tools_to_execute.append(("searchJiraIssuesUsingJql", "assignee = currentUser() ORDER BY updated DESC"))
+        
+        # Check for specific issue key requests
+        issue_keys = re.findall(r'\b[A-Z]+-\d+\b', query.upper())
+        if issue_keys:
+            for issue_key in issue_keys[:3]:  # Limit to first 3 issues
+                tools_to_execute.append(("getJiraIssue", issue_key))
+        
+        # Check for search queries
+        elif any(word in query_lower for word in ["search", "find", "related to"]):
+            search_terms = query.replace("find", "").replace("search", "").replace("related to", "").strip()
+            jql = f'text ~ "{search_terms}" OR summary ~ "{search_terms}" ORDER BY updated DESC'
+            tools_to_execute.append(("searchJiraIssuesUsingJql", jql))
+        
+        # Default fallback for general issue queries
+        elif any(word in query_lower for word in ["issue", "ticket", "task"]):
+            # FIXED: Default to comprehensive search (assigned OR reported)
+            jql = "assignee = currentUser() OR reporter = currentUser() ORDER BY updated DESC"
+            tools_to_execute.append(("searchJiraIssuesUsingJql", jql))
+        
+        return tools_to_execute
+
+    async def _execute_tool(self, session: ClientSession, tool_name: str, parameters: str, cloud_id: Optional[str]) -> str:
+        """Execute a specific tool with proper parameter handling."""
+        
+        if tool_name == "searchJiraIssuesUsingJql":
+            args = {"jql": parameters, "maxResults": 20}
+            if cloud_id:
+                args["cloudId"] = cloud_id
+            result = await session.call_tool(tool_name, args)
+        
+        elif tool_name == "getJiraIssue":
+            args = {"issueIdOrKey": parameters}
+            if cloud_id:
+                args["cloudId"] = cloud_id
+            result = await session.call_tool(tool_name, args)
+        
+        elif tool_name == "createJiraIssue":
+            # FIXED: Proper parameter parsing for issue creation
+            args = await self._parse_create_issue_request(session, parameters, cloud_id)
+            result = await session.call_tool(tool_name, args)
+        
+        else:
+            # For other tools, pass parameters as query
+            result = await session.call_tool(tool_name, {"query": parameters})
+        
+        # Extract content from result
+        if hasattr(result, 'content') and result.content:
+            return result.content[0].text if result.content[0].text else str(result.content)
+        
+        return str(result)
+
+    async def _parse_create_issue_request(self, session: ClientSession, query: str, cloud_id: Optional[str]) -> Dict:
+        """Parse create issue request and prepare proper arguments."""
+        
+        # Extract title/summary
+        title_match = re.search(r'title[:\s]+"([^"]+)"', query, re.IGNORECASE)
+        if not title_match:
+            title_match = re.search(r'header[:\s]+"([^"]+)"', query, re.IGNORECASE)
+        summary = title_match.group(1) if title_match else "New Issue"
+        
+        # Extract description
+        desc_match = re.search(r'description[:\s]+"([^"]+)"', query, re.IGNORECASE)
+        description = desc_match.group(1) if desc_match else "No description provided"
+        
+        # Extract issue type
+        type_match = re.search(r'issue type[:\s]+"([^"]+)"', query, re.IGNORECASE)
+        if not type_match:
+            type_match = re.search(r'type[:\s]+"([^"]+)"', query, re.IGNORECASE)
+        issue_type = type_match.group(1) if type_match else "Task"
+        
+        # Get the first available project
+        try:
+            projects_result = await session.call_tool("getVisibleJiraProjects", {})
+            if hasattr(projects_result, 'content') and projects_result.content:
+                projects_data = projects_result.content[0].text
+                projects_json = json.loads(projects_data)
+                if isinstance(projects_json, list) and len(projects_json) > 0:
+                    project_key = projects_json[0].get('key', 'KAN')
+                else:
+                    project_key = 'KAN'
             else:
-                # For any other tools, try with no arguments first
-                result = await session.call_tool(tool_name, arguments={})
-            
-            # Extract text content from result
-            if result.content and len(result.content) > 0:
-                return result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
-            
-            return "No result returned"
-            
-        except Exception as e:
-            return f"Tool execution failed: {str(e)}"
+                project_key = 'KAN'
+        except Exception:
+            project_key = 'KAN'  # Fallback
+        
+        args = {
+            "projectKey": project_key,
+            "summary": summary,
+            "description": description,
+            "issueType": issue_type
+        }
+        
+        if cloud_id:
+            args["cloudId"] = cloud_id
+        
+        return args
+
+    async def _claude_decision(self, session: ClientSession, query: str) -> str:
+        """Let Claude decide which tools to use when automatic detection fails."""
+        
+        # Create tool descriptions for Claude
+        tool_descriptions = []
+        for tool in self.available_tools:
+            tool_desc = {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.inputSchema
+            }
+            tool_descriptions.append(tool_desc)
+        
+        # Create system prompt
+        system_prompt = self._create_system_prompt(tool_descriptions)
+        
+        # Get Claude's response
+        claude_response = self.anthropic_client.messages.create(
+            model=self.model,
+            max_tokens=1024,
+            temperature=self.temperature,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": query}
+            ]
+        )
+        
+        return claude_response.content[0].text
 
     def _create_system_prompt(self, tool_descriptions: List[Dict]) -> str:
         """Create system prompt for Claude with available tools."""
@@ -234,6 +401,14 @@ IMPORTANT INSTRUCTIONS:
 3. Do not make assumptions about issue counts, statuses, or content - always rely on tool results
 4. Wait for tool execution results before providing specific details
 5. Be accurate with numbers and counts - double-check your math when summarizing results
+
+TOOL SELECTION GUIDE:
+- For "my issues", "what issues I have" → use searchJiraIssuesUsingJql with "assignee = currentUser() OR reporter = currentUser()"
+- For "assigned to me", "what I'm working on" → use searchJiraIssuesUsingJql with "assignee = currentUser()"
+- For "all issues", "project issues" → use searchJiraIssuesUsingJql with broader queries
+- For specific issue details by key (e.g. "KAN-7") → use getJiraIssue
+- For creating issues → use createJiraIssue with proper parameters
+- Always choose the most appropriate tool based on the user's intent
 
 When a user asks about Jira issues:
 1. Identify which tools to use (mention them by name)

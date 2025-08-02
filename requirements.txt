@@ -1,11 +1,13 @@
-# MCP and Claude Sonnet 4 dependencies
+# Claude Sonnet 4 + Official Atlassian MCP dependencies
 anthropic
 mcp[cli]
 pydantic
 python-dotenv
+
+# Optional: For custom server fallback
 requests
 
-# Legacy dependencies (can be removed after migration)
+# Legacy dependencies (can be removed after full migration)
 # langchain
 # langchain-community  
 # langchain-openai

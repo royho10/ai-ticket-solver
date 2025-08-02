@@ -1,6 +1,11 @@
-requests
-langchain
-langchain-community
-langchain-openai
+# MCP and Claude Sonnet 4 dependencies
+anthropic
+mcp[cli]
 pydantic
 python-dotenv
+requests
+
+# Legacy dependencies (can be removed after migration)
+# langchain
+# langchain-community  
+# langchain-openai

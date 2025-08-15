@@ -1,19 +1,20 @@
 """
-Claude Sonnet 4 + MCP Jira Agent
+Multi-MCP Server Agent with Atlassian Integration
 
-This is the modern replacement for the LangChain-based agent.
-Uses Claude Sonnet 4 through Anthropic's API and connects to Jira via MCP.
+Scalable agent architecture that can work with multiple MCP servers:
+- Generic MCP client framework
+- Server-specific adapters (Atlassian, future servers)
+- Clean separation between generic and server-specific functionality
+- Easy to extend with new MCP servers
 """
 
 import asyncio
-import os
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, List
 from dotenv import load_dotenv
-import anthropic
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from mcp.types import Tool, Resource
+
+from .base_client import GenericMCPClient, BaseMCPServerAdapter
+from .atlassian_adapter import create_atlassian_adapter
 
 
 # Load environment variables
@@ -21,279 +22,276 @@ env_path = Path.cwd() / ".env"
 load_dotenv(dotenv_path=env_path)
 
 
-class ClaudeJiraAgent:
-    """Modern MCP-based Jira agent using Claude Sonnet 4."""
+class MultiMCPAgent:
+    """
+    Multi-MCP Server Agent that can connect to multiple MCP servers.
 
-    def __init__(self, model: str = "claude-3-5-sonnet-20241022", temperature: float = 0, verbose: bool = True):
+    This agent provides a unified interface to work with different MCP servers
+    through server-specific adapters. Currently supports:
+    - Atlassian MCP Server (Jira & Confluence)
+
+    Future servers can be easily added by creating new adapter classes.
+    """
+
+    def __init__(
+        self,
+        ai_model: str = "claude-3-5-sonnet-20241022",
+        temperature: float = 0,
+        verbose: bool = True,
+        mcp_verbose: bool = False,
+        adapters: Optional[List[BaseMCPServerAdapter]] = None,
+    ):
         """
-        Initialize the Claude Jira Agent.
-        
+        Initialize the Multi-MCP Agent.
+
         Args:
-            model: Claude model to use (claude-3-5-sonnet-20241022 is currently the latest)
-            temperature: Temperature for Claude responses (0-1)
+            ai_model: Claude model to use for AI processing
+            temperature: Temperature for AI responses (0-1)
             verbose: Whether to print debug information
+            mcp_verbose: Whether to show verbose MCP protocol output (False = quieter operation)
+            adapters: List of MCP server adapters to register. If None, defaults to Atlassian only.
         """
-        self.model = model
-        self.temperature = temperature
         self.verbose = verbose
-        
-        # Initialize Anthropic client
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key or api_key == "your_anthropic_api_key_here":
-            raise ValueError(
-                "ANTHROPIC_API_KEY not found or not set. "
-                "Please add your Anthropic API key to the .env file. "
-                "Get one at: https://console.anthropic.com/account/keys"
-            )
-        
-        self.anthropic_client = anthropic.Anthropic(api_key=api_key)
-        self.mcp_session: Optional[ClientSession] = None
-        self.available_tools: List[Tool] = []
-        self.available_resources: List[Resource] = []
 
-    async def initialize_mcp(self) -> bool:
-        """
-        Initialize connection to Atlassian MCP server.
-        
-        Returns:
-            bool: True if successful, False otherwise
-        """
+        # Initialize the generic MCP client with verbosity control
+        self.mcp_client = GenericMCPClient(
+            ai_model=ai_model,
+            temperature=temperature,
+            verbose=verbose,
+            mcp_verbose=mcp_verbose,
+        )
+
+        # Register MCP server adapters
+        self._register_adapters(adapters)
+
+        # Track initialization state
+        self._initialized = False
+
+    def _register_adapters(
+        self, adapters: Optional[List[BaseMCPServerAdapter]] = None
+    ) -> None:
+        """Register MCP server adapters."""
+        if adapters is None:
+            # Default to Atlassian adapter for backward compatibility
+            adapters = self._get_default_adapters()
+
+        for adapter in adapters:
+            try:
+                self.mcp_client.register_mcp_server(adapter)
+
+                if self.verbose:
+                    print(f"📋 Registered {adapter.config.name} MCP adapter")
+
+            except Exception as e:
+                if self.verbose:
+                    print(f"❌ Failed to register {adapter.config.name} adapter: {e}")
+
+    def _get_default_adapters(self) -> List[BaseMCPServerAdapter]:
+        """Get default adapters (for backward compatibility)."""
         try:
-            if self.verbose:
-                print("🔗 Initializing connection to Atlassian MCP server...")
-            
-            # For now, we'll use our custom MCP server since the official one isn't installed yet
-            # TODO: Replace with official Atlassian MCP server when available
-            server_params = StdioServerParameters(
-                command="python",
-                args=[str(Path(__file__).parent.parent / "mcp_server" / "jira_server.py")],
-                env=dict(os.environ)  # Pass all environment variables
+            atlassian_adapter = create_atlassian_adapter(
+                verbose=self.verbose, mcp_verbose=self.mcp_client.mcp_verbose
             )
-            
-            # Note: We'll create a context manager approach for the MCP session
-            self._server_params = server_params
-            
-            if self.verbose:
-                print("✅ MCP server parameters configured")
-            
-            return True
-            
+            return [atlassian_adapter]
         except Exception as e:
             if self.verbose:
-                print(f"❌ Failed to initialize MCP: {str(e)}")
+                print(f"❌ Failed to create default Atlassian adapter: {e}")
+            return []
+
+    async def initialize_all_connections(self) -> bool:
+        """
+        Initialize connections to all registered MCP servers.
+
+        Returns:
+            bool: True if at least one server connected successfully
+        """
+        if self._initialized:
+            return True
+
+        try:
+            if self.verbose:
+                print("🚀 Initializing Multi-MCP Agent...")
+
+            # Initialize all server connections
+            connection_results = await self.mcp_client.initialize_all_connections()
+
+            # Check if any connections succeeded
+            successful_connections = sum(
+                1 for success in connection_results.values() if success
+            )
+            total_servers = len(connection_results)
+
+            if successful_connections > 0:
+                self._initialized = True
+                if self.verbose:
+                    print(
+                        f"✅ Multi-MCP Agent ready! ({successful_connections}/{total_servers} servers connected)"
+                    )
+                return True
+            else:
+                if self.verbose:
+                    print("❌ No MCP servers connected successfully")
+                return False
+
+        except Exception as e:
+            if self.verbose:
+                print(f"❌ Failed to initialize MCP connections: {e}")
             return False
 
-    async def _execute_with_mcp(self, query: str) -> str:
-        """Execute a query using MCP tools and Claude Sonnet 4."""
-        try:
-            async with stdio_client(self._server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    
-                    # Get available tools
-                    tools_response = await session.list_tools()
-                    self.available_tools = tools_response.tools
-                    
-                    # Get available resources
-                    resources_response = await session.list_resources()
-                    self.available_resources = resources_response.resources
-                    
-                    if self.verbose:
-                        print(f"🔧 Available tools: {[tool.name for tool in self.available_tools]}")
-                        print(f"📚 Available resources: {len(self.available_resources)} resources")
-                    
-                    # Create tool descriptions for Claude
-                    tool_descriptions = []
-                    for tool in self.available_tools:
-                        tool_desc = {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": tool.inputSchema
-                        }
-                        tool_descriptions.append(tool_desc)
-                    
-                    # Create the system prompt with available tools
-                    system_prompt = self._create_system_prompt(tool_descriptions)
-                    
-                    # Initial Claude response to understand what tools to use
-                    claude_response = self.anthropic_client.messages.create(
-                        model=self.model,
-                        max_tokens=1024,
-                        temperature=self.temperature,
-                        system=system_prompt,
-                        messages=[
-                            {"role": "user", "content": query}
-                        ]
-                    )
-                    
-                    response_text = claude_response.content[0].text
-                    
-                    if self.verbose:
-                        print(f"🤖 Claude's initial response: {response_text}")
-                    
-                    # Simple tool detection - look for tool calls in Claude's response
-                    # This is a basic implementation; in production, you'd use tool calling APIs
-                    tool_results = []
-                    
-                    # Check if Claude wants to use specific tools
-                    for tool in self.available_tools:
-                        if tool.name.lower() in response_text.lower():
-                            try:
-                                if self.verbose:
-                                    print(f"🔧 Executing tool: {tool.name}")
-                                
-                                # Execute the tool with basic parameters
-                                # This is simplified - in production, you'd parse Claude's intent better
-                                tool_result = await self._execute_tool(session, tool.name, query)
-                                tool_results.append(f"Tool '{tool.name}' result: {tool_result}")
-                                
-                            except Exception as e:
-                                tool_results.append(f"Tool '{tool.name}' failed: {str(e)}")
-                    
-                    # Get final response from Claude with tool results
-                    if tool_results:
-                        final_query = f"""
-Original query: {query}
-
-Tool execution results:
-{chr(10).join(tool_results)}
-
-Please provide a comprehensive response based on the tool results above.
-"""
-                        
-                        final_response = self.anthropic_client.messages.create(
-                            model=self.model,
-                            max_tokens=1024,
-                            temperature=self.temperature,
-                            messages=[
-                                {"role": "user", "content": final_query}
-                            ]
-                        )
-                        
-                        return final_response.content[0].text
-                    
-                    return response_text
-                    
-        except Exception as e:
-            error_msg = f"❌ Error executing MCP query: {str(e)}"
-            if self.verbose:
-                print(error_msg)
-            return error_msg
-
-    async def _execute_tool(self, session: ClientSession, tool_name: str, query: str) -> str:
-        """Execute a specific MCP tool."""
-        try:
-            # Extract issue key from query for tools that need it
-            def extract_issue_key(text: str) -> str:
-                """Extract Jira issue key from text (e.g., KAN-3, PROJ-123)."""
-                import re
-                # Look for pattern like KAN-3, PROJ-123, etc.
-                pattern = r'\b[A-Z]+-\d+\b'
-                matches = re.findall(pattern, text.upper())
-                return matches[0] if matches else None
-            
-            if tool_name == "get_my_jira_issues":
-                result = await session.call_tool(tool_name, arguments={})
-            
-            elif tool_name in ["get_jira_issue_summary", "get_jira_issue_description", "get_jira_issue_full_details"]:
-                # These tools require an issue_key parameter
-                issue_key = extract_issue_key(query)
-                if not issue_key:
-                    return f"Error: Could not find a valid Jira issue key in the query. Please specify an issue key like 'KAN-3'."
-                
-                result = await session.call_tool(tool_name, arguments={"issue_key": issue_key})
-            
-            else:
-                # For any other tools, try with no arguments first
-                result = await session.call_tool(tool_name, arguments={})
-            
-            # Extract text content from result
-            if result.content and len(result.content) > 0:
-                return result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
-            
-            return "No result returned"
-            
-        except Exception as e:
-            return f"Tool execution failed: {str(e)}"
-
-    def _create_system_prompt(self, tool_descriptions: List[Dict]) -> str:
-        """Create system prompt for Claude with available tools."""
-        tools_text = "\n".join([
-            f"- {tool['name']}: {tool['description']}"
-            for tool in tool_descriptions
-        ])
-        
-        return f"""You are a helpful Jira assistant powered by Claude Sonnet 4. You can help users manage their Jira tickets, search for issues, get ticket details, and perform various Jira operations.
-
-Available tools:
-{tools_text}
-
-IMPORTANT INSTRUCTIONS:
-1. NEVER provide specific Jira issue details, counts, or status information without first using the appropriate tools
-2. When asked about issues, tickets, or Jira data, you MUST use the tools to get current information
-3. Do not make assumptions about issue counts, statuses, or content - always rely on tool results
-4. Wait for tool execution results before providing specific details
-5. Be accurate with numbers and counts - double-check your math when summarizing results
-
-When a user asks about Jira issues:
-1. Identify which tools to use (mention them by name)
-2. Execute the tools to get current data  
-3. Provide accurate information based ONLY on the tool results
-4. Count carefully and be precise with numbers
-
-You have access to the Jira instance at royho10.atlassian.net. Be helpful, accurate, and concise in your responses, but always use tools for current data."""
-
-    async def run(self, query: str) -> str:
+    async def chat(self, query: str) -> str:
         """
-        Run a query through the Claude Jira agent.
-        
+        Process a user query across all connected MCP servers.
+
         Args:
             query: The user's question or request
-            
+
         Returns:
-            str: The agent's response
+            str: The agent's response combining results from relevant servers
         """
         try:
-            if not hasattr(self, '_server_params'):
-                success = await self.initialize_mcp()
+            # Ensure connections are initialized
+            if not self._initialized:
+                success = await self.initialize_all_connections()
                 if not success:
-                    return "❌ Failed to initialize MCP connection. Please check your configuration."
-            
-            return await self._execute_with_mcp(query)
-            
+                    return "❌ No MCP servers are available. Please check your configuration."
+
+            # Execute query across relevant servers
+            return await self.mcp_client.execute_multi_server_query(query)
+
         except Exception as e:
             error_msg = f"❌ Error processing query: {str(e)}"
             if self.verbose:
                 print(error_msg)
             return error_msg
 
-    def run_sync(self, query: str) -> str:
+    def chat_sync(self, query: str) -> str:
         """
-        Synchronous wrapper for the async run method.
-        
+        Synchronous wrapper for the async chat method.
+
         Args:
             query: The user's question or request
-            
+
         Returns:
             str: The agent's response
         """
-        return asyncio.run(self.run(query))
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're already in an event loop, we need to handle this differently
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, self.chat(query))
+                    return future.result()
+            else:
+                return asyncio.run(self.chat(query))
+        except RuntimeError:
+            # Fallback for event loop issues
+            return asyncio.run(self.chat(query))
+
+    def add_mcp_server_adapter(self, adapter) -> None:
+        """
+        Add a custom MCP server adapter.
+
+        Args:
+            adapter: An instance of BaseMCPServerAdapter or its subclass
+        """
+        self.mcp_client.register_mcp_server(adapter)
+        # Reset initialization to force reconnection
+        self._initialized = False
+
+    def get_connected_servers(self) -> list:
+        """Get list of connected MCP server names."""
+        return list(self.mcp_client.server_adapters.keys())
+
+    async def get_all_capabilities(self) -> str:
+        """Get capabilities summary from all connected servers."""
+        return await self.mcp_client._format_all_capabilities()
+
+
+# Backward compatibility classes and functions
+class ClaudeJiraAgent(MultiMCPAgent):
+    """
+    Backward compatibility class for ClaudeJiraAgent.
+
+    This is now a specialized version of MultiMCPAgent that focuses on Atlassian.
+    """
+
+    def __init__(self, **kwargs):
+        # Ensure Atlassian adapter is included for backward compatibility
+        if "adapters" not in kwargs:
+            kwargs["adapters"] = None  # Will use default adapters (Atlassian)
+        super().__init__(**kwargs)
+
+    async def run(self, query: str) -> str:
+        """Backward compatibility method."""
+        return await self.chat(query)
+
+    def run_sync(self, query: str) -> str:
+        """Backward compatibility method."""
+        return self.chat_sync(query)
+
+
+def create_multi_mcp_agent(**kwargs) -> MultiMCPAgent:
+    """
+    Create a Multi-MCP agent instance.
+
+    Args:
+        **kwargs: Arguments to pass to MultiMCPAgent constructor
+
+    Returns:
+        MultiMCPAgent: A new agent instance
+    """
+    return MultiMCPAgent(**kwargs)
 
 
 def create_claude_jira_agent(**kwargs) -> ClaudeJiraAgent:
     """
-    Create a Claude Jira agent instance.
-    
+    Create a Claude Jira agent instance (backward compatibility).
+
     Args:
         **kwargs: Arguments to pass to ClaudeJiraAgent constructor
-        
+
     Returns:
-        ClaudeJiraAgent: A new agent instance
+        ClaudeJiraAgent: A new agent instance focused on Atlassian
     """
     return ClaudeJiraAgent(**kwargs)
 
 
-# For backward compatibility with the old agent interface
-def create_jira_agent():
+def create_jira_agent(**kwargs):
     """Create a Jira agent instance (legacy compatibility)."""
-    return create_claude_jira_agent()
+    return create_claude_jira_agent(**kwargs)
+
+
+# Example of how to add new MCP servers:
+#
+# from .github_adapter import create_github_adapter
+# from .slack_adapter import create_slack_adapter
+#
+# # Create individual adapters
+# github_adapter = create_github_adapter()
+# slack_adapter = create_slack_adapter()
+# atlassian_adapter = create_atlassian_adapter()
+#
+# # Create agent with multiple adapters
+# agent = MultiMCPAgent(
+#     adapters=[atlassian_adapter, github_adapter, slack_adapter],
+#     verbose=True
+# )
+#
+# # Or extend the agent class for convenience
+# class ExtendedMultiMCPAgent(MultiMCPAgent):
+#     def __init__(self, enable_github=False, enable_slack=False, **kwargs):
+#         adapters = []
+#
+#         # Always include Atlassian by default
+#         adapters.append(create_atlassian_adapter())
+#
+#         if enable_github:
+#             adapters.append(create_github_adapter())
+#
+#         if enable_slack:
+#             adapters.append(create_slack_adapter())
+#
+#         kwargs['adapters'] = adapters
+#         super().__init__(**kwargs)

@@ -1,299 +1,292 @@
 """
-Claude Sonnet 4 + MCP Jira Agent
+Simple Agent using MCP tools and Claude directly.
 
-This is the modern replacement for the LangChain-based agent.
-Uses Claude Sonnet 4 through Anthropic's API and connects to Jira via MCP.
+This agent dynamically gets tools from MCP servers and uses Claude
+to handle user queries without any server-specific code.
 """
 
-import asyncio
-import os
-from pathlib import Path
-from typing import Optional, Dict, List
-from dotenv import load_dotenv
+from typing import List
 import anthropic
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from mcp.types import Tool, Resource
+
+from .mcp_client import MCPClientManager
 
 
-# Load environment variables
-env_path = Path.cwd() / ".env"
-load_dotenv(dotenv_path=env_path)
+class SimpleAgent:
+    """Simple agent that uses Claude with dynamically fetched MCP tools."""
 
-
-class ClaudeJiraAgent:
-    """Modern MCP-based Jira agent using Claude Sonnet 4."""
-
-    def __init__(self, model: str = "claude-3-5-sonnet-20241022", temperature: float = 0, verbose: bool = True):
-        """
-        Initialize the Claude Jira Agent.
-        
-        Args:
-            model: Claude model to use (claude-3-5-sonnet-20241022 is currently the latest)
-            temperature: Temperature for Claude responses (0-1)
-            verbose: Whether to print debug information
-        """
+    def __init__(
+        self, model: str = "claude-3-5-sonnet-20241022", temperature: float = 0
+    ):
+        self.anthropic_client = anthropic.Anthropic()
         self.model = model
         self.temperature = temperature
-        self.verbose = verbose
-        
-        # Initialize Anthropic client
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key or api_key == "your_anthropic_api_key_here":
-            raise ValueError(
-                "ANTHROPIC_API_KEY not found or not set. "
-                "Please add your Anthropic API key to the .env file. "
-                "Get one at: https://console.anthropic.com/account/keys"
-            )
-        
-        self.anthropic_client = anthropic.Anthropic(api_key=api_key)
-        self.mcp_session: Optional[ClientSession] = None
-        self.available_tools: List[Tool] = []
-        self.available_resources: List[Resource] = []
+        self.mcp_manager = MCPClientManager()
+        self.tools = []
 
-    async def initialize_mcp(self) -> bool:
+    async def initialize(self):
+        """Initialize the agent by fetching tools from MCP servers."""
+        # Fetch tools dynamically from all registered adapters
+        self.tools = await self.mcp_manager.get_tools()
+        print(f"🤖 Agent initialized with {len(self.tools)} tools")
+
+    def register_adapter(self, adapter):
+        """Register an MCP adapter."""
+        self.mcp_manager.register_adapter(adapter)
+
+    async def chat(self, query: str, system_prompt: str = None) -> str:
         """
-        Initialize connection to Atlassian MCP server.
-        
+        Process a user query using Claude with available tools.
+
+        Args:
+            query: User's question or request
+            system_prompt: Optional system prompt to guide the agent
+
         Returns:
-            bool: True if successful, False otherwise
+            Agent's response
         """
+        if not self.tools:
+            await self.initialize()
+
         try:
-            if self.verbose:
-                print("🔗 Initializing connection to Atlassian MCP server...")
-            
-            # For now, we'll use our custom MCP server since the official one isn't installed yet
-            # TODO: Replace with official Atlassian MCP server when available
-            server_params = StdioServerParameters(
-                command="python",
-                args=[str(Path(__file__).parent.parent / "mcp_server" / "jira_server.py")],
-                env=dict(os.environ)  # Pass all environment variables
-            )
-            
-            # Note: We'll create a context manager approach for the MCP session
-            self._server_params = server_params
-            
-            if self.verbose:
-                print("✅ MCP server parameters configured")
-            
-            return True
-            
-        except Exception as e:
-            if self.verbose:
-                print(f"❌ Failed to initialize MCP: {str(e)}")
-            return False
+            # Convert LangChain tools to Claude tool format
+            claude_tools = self._convert_tools_for_claude()
 
-    async def _execute_with_mcp(self, query: str) -> str:
-        """Execute a query using MCP tools and Claude Sonnet 4."""
-        try:
-            async with stdio_client(self._server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    
-                    # Get available tools
-                    tools_response = await session.list_tools()
-                    self.available_tools = tools_response.tools
-                    
-                    # Get available resources
-                    resources_response = await session.list_resources()
-                    self.available_resources = resources_response.resources
-                    
-                    if self.verbose:
-                        print(f"🔧 Available tools: {[tool.name for tool in self.available_tools]}")
-                        print(f"📚 Available resources: {len(self.available_resources)} resources")
-                    
-                    # Create tool descriptions for Claude
-                    tool_descriptions = []
-                    for tool in self.available_tools:
-                        tool_desc = {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": tool.inputSchema
-                        }
-                        tool_descriptions.append(tool_desc)
-                    
-                    # Create the system prompt with available tools
-                    system_prompt = self._create_system_prompt(tool_descriptions)
-                    
-                    # Initial Claude response to understand what tools to use
-                    claude_response = self.anthropic_client.messages.create(
-                        model=self.model,
-                        max_tokens=1024,
-                        temperature=self.temperature,
-                        system=system_prompt,
-                        messages=[
-                            {"role": "user", "content": query}
-                        ]
-                    )
-                    
-                    response_text = claude_response.content[0].text
-                    
-                    if self.verbose:
-                        print(f"🤖 Claude's initial response: {response_text}")
-                    
-                    # Simple tool detection - look for tool calls in Claude's response
-                    # This is a basic implementation; in production, you'd use tool calling APIs
-                    tool_results = []
-                    
-                    # Check if Claude wants to use specific tools
-                    for tool in self.available_tools:
-                        if tool.name.lower() in response_text.lower():
-                            try:
-                                if self.verbose:
-                                    print(f"🔧 Executing tool: {tool.name}")
-                                
-                                # Execute the tool with basic parameters
-                                # This is simplified - in production, you'd parse Claude's intent better
-                                tool_result = await self._execute_tool(session, tool.name, query)
-                                tool_results.append(f"Tool '{tool.name}' result: {tool_result}")
-                                
-                            except Exception as e:
-                                tool_results.append(f"Tool '{tool.name}' failed: {str(e)}")
-                    
-                    # Get final response from Claude with tool results
-                    if tool_results:
-                        final_query = f"""
-Original query: {query}
+            # Build system prompt
+            default_system = """You are a helpful assistant with access to various tools.
 
-Tool execution results:
-{chr(10).join(tool_results)}
+When you need to use a tool to answer the user's question, use the appropriate tool and provide a response based on the results.
 
-Please provide a comprehensive response based on the tool results above.
-"""
-                        
-                        final_response = self.anthropic_client.messages.create(
-                            model=self.model,
-                            max_tokens=1024,
-                            temperature=self.temperature,
-                            messages=[
-                                {"role": "user", "content": final_query}
-                            ]
-                        )
-                        
-                        return final_response.content[0].text
-                    
-                    return response_text
-                    
-        except Exception as e:
-            error_msg = f"❌ Error executing MCP query: {str(e)}"
-            if self.verbose:
-                print(error_msg)
-            return error_msg
+For Jira queries, be efficient:
+- ALWAYS start by getting the cloudId using Atlassian_getAccessibleAtlassianResources
+- Then use Atlassian_searchJiraIssuesUsingJql directly for ticket searches
+- Don't call Atlassian_atlassianUserInfo unless specifically asked for user information
+- For user's tickets: "assignee = currentUser() ORDER BY updated DESC"
+- For tickets they reported: "reporter = currentUser() ORDER BY created DESC" 
+- For recent tickets: "updated >= -7d ORDER BY updated DESC"
 
-    async def _execute_tool(self, session: ClientSession, tool_name: str, query: str) -> str:
-        """Execute a specific MCP tool."""
-        try:
-            # Extract issue key from query for tools that need it
-            def extract_issue_key(text: str) -> str:
-                """Extract Jira issue key from text (e.g., KAN-3, PROJ-123)."""
-                import re
-                # Look for pattern like KAN-3, PROJ-123, etc.
-                pattern = r'\b[A-Z]+-\d+\b'
-                matches = re.findall(pattern, text.upper())
-                return matches[0] if matches else None
-            
-            if tool_name == "get_my_jira_issues":
-                result = await session.call_tool(tool_name, arguments={})
-            
-            elif tool_name in ["get_jira_issue_summary", "get_jira_issue_description", "get_jira_issue_full_details"]:
-                # These tools require an issue_key parameter
-                issue_key = extract_issue_key(query)
-                if not issue_key:
-                    return f"Error: Could not find a valid Jira issue key in the query. Please specify an issue key like 'KAN-3'."
-                
-                result = await session.call_tool(tool_name, arguments={"issue_key": issue_key})
-            
+Be helpful and provide clear, concise responses based on actual tool results."""
+
+            if system_prompt:
+                final_system = f"{system_prompt}\n\n{default_system}"
             else:
-                # For any other tools, try with no arguments first
-                result = await session.call_tool(tool_name, arguments={})
-            
-            # Extract text content from result
-            if result.content and len(result.content) > 0:
-                return result.content[0].text if hasattr(result.content[0], 'text') else str(result.content[0])
-            
-            return "No result returned"
-            
+                final_system = default_system
+
+            # First call to Claude with tools
+            response = self.anthropic_client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                temperature=self.temperature,
+                system=final_system,
+                tools=claude_tools,
+                messages=[{"role": "user", "content": query}],
+            )
+
+            # Check if Claude wants to use tools
+            if response.stop_reason == "tool_use":
+                return await self._handle_tool_calls(response, query, final_system)
+            else:
+                # Find the text content in the response
+                for content_block in response.content:
+                    if content_block.type == "text":
+                        return content_block.text
+                return "No text response found"
+
         except Exception as e:
-            return f"Tool execution failed: {str(e)}"
+            return f"Error processing query: {str(e)}"
 
-    def _create_system_prompt(self, tool_descriptions: List[Dict]) -> str:
-        """Create system prompt for Claude with available tools."""
-        tools_text = "\n".join([
-            f"- {tool['name']}: {tool['description']}"
-            for tool in tool_descriptions
-        ])
-        
-        return f"""You are a helpful Jira assistant powered by Claude Sonnet 4. You can help users manage their Jira tickets, search for issues, get ticket details, and perform various Jira operations.
+    async def _handle_tool_calls(
+        self, response, original_query: str, system_prompt: str
+    ) -> str:
+        """Handle tool calls from Claude, including chained tool calls."""
+        messages = [{"role": "user", "content": original_query}]
 
-Available tools:
-{tools_text}
+        current_response = response
+        max_iterations = 3  # Reduced from 5 to save API calls
+        iteration = 0
 
-IMPORTANT INSTRUCTIONS:
-1. NEVER provide specific Jira issue details, counts, or status information without first using the appropriate tools
-2. When asked about issues, tickets, or Jira data, you MUST use the tools to get current information
-3. Do not make assumptions about issue counts, statuses, or content - always rely on tool results
-4. Wait for tool execution results before providing specific details
-5. Be accurate with numbers and counts - double-check your math when summarizing results
+        while current_response.stop_reason == "tool_use" and iteration < max_iterations:
+            iteration += 1
+            print(f"🔧 Tool call iteration {iteration}")
 
-When a user asks about Jira issues:
-1. Identify which tools to use (mention them by name)
-2. Execute the tools to get current data  
-3. Provide accurate information based ONLY on the tool results
-4. Count carefully and be precise with numbers
+            # Add Claude's response with tool calls
+            claude_content = []
+            for content_block in current_response.content:
+                if content_block.type == "text":
+                    claude_content.append({"type": "text", "text": content_block.text})
+                elif content_block.type == "tool_use":
+                    claude_content.append(
+                        {
+                            "type": "tool_use",
+                            "id": content_block.id,
+                            "name": content_block.name,
+                            "input": content_block.input,
+                        }
+                    )
 
-You have access to the Jira instance at royho10.atlassian.net. Be helpful, accurate, and concise in your responses, but always use tools for current data."""
+            messages.append({"role": "assistant", "content": claude_content})
 
-    async def run(self, query: str) -> str:
-        """
-        Run a query through the Claude Jira agent.
-        
-        Args:
-            query: The user's question or request
-            
-        Returns:
-            str: The agent's response
-        """
-        try:
-            if not hasattr(self, '_server_params'):
-                success = await self.initialize_mcp()
-                if not success:
-                    return "❌ Failed to initialize MCP connection. Please check your configuration."
-            
-            return await self._execute_with_mcp(query)
-            
-        except Exception as e:
-            error_msg = f"❌ Error processing query: {str(e)}"
-            if self.verbose:
-                print(error_msg)
-            return error_msg
+            # Execute tools and add results
+            for content_block in current_response.content:
+                if content_block.type == "tool_use":
+                    try:
+                        # Find the tool and execute it
+                        tool_name = content_block.name
+                        tool_input = content_block.input
+                        print(
+                            f"🔧 Executing tool: {tool_name} with input: {tool_input}"
+                        )
 
-    def run_sync(self, query: str) -> str:
-        """
-        Synchronous wrapper for the async run method.
-        
-        Args:
-            query: The user's question or request
-            
-        Returns:
-            str: The agent's response
-        """
-        return asyncio.run(self.run(query))
+                        # Find the tool in our tools list
+                        tool = next(
+                            (t for t in self.tools if t.name == tool_name), None
+                        )
+                        if tool:
+                            # Execute tool using standard LangChain interface
+                            result = await tool.ainvoke(tool_input)
+                            print(f"✅ Tool result length: {len(str(result))}")
+
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": content_block.id,
+                                            "content": str(result),
+                                        }
+                                    ],
+                                }
+                            )
+                        else:
+                            print(f"❌ Tool not found: {tool_name}")
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": content_block.id,
+                                            "content": f"Tool {tool_name} not found",
+                                        }
+                                    ],
+                                }
+                            )
+                    except Exception as e:
+                        print(f"❌ Tool execution error: {e}")
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": content_block.id,
+                                        "content": f"Error executing tool: {str(e)}",
+                                    }
+                                ],
+                            }
+                        )
+
+            # Get next response from Claude
+            print(f"📤 Sending {len(messages)} messages to Claude")
+            current_response = self.anthropic_client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                temperature=self.temperature,
+                system=system_prompt,
+                tools=self._convert_tools_for_claude(),
+                messages=messages,
+            )
+            print(f"📥 Got response with stop_reason: {current_response.stop_reason}")
+
+        # Find the text content in the final response
+        for content_block in current_response.content:
+            if content_block.type == "text":
+                return content_block.text
+
+        return "No text response found in final response"
+
+    def _convert_tools_for_claude(self) -> List[dict]:
+        """Convert LangChain tools to Claude tool format."""
+        claude_tools = []
+        for tool in self.tools:
+            claude_tool = {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }
+
+            # Try to extract schema from the tool if available
+            if hasattr(tool, "args_schema") and tool.args_schema:
+                # Convert Pydantic schema to JSON schema
+                schema = tool.args_schema.model_json_schema()
+                # Ensure the schema has required fields for Claude
+                if isinstance(schema, dict):
+                    # Make sure it has type: object
+                    if "type" not in schema:
+                        schema["type"] = "object"
+                    # Make sure it has properties
+                    if "properties" not in schema:
+                        schema["properties"] = {}
+                    # Make sure it has required array
+                    if "required" not in schema:
+                        schema["required"] = []
+                    claude_tool["input_schema"] = schema
+            elif hasattr(tool, "get_input_schema"):
+                # Alternative: use get_input_schema method
+                try:
+                    schema_class = tool.get_input_schema()
+                    if schema_class and hasattr(schema_class, "model_json_schema"):
+                        schema = schema_class.model_json_schema()
+                        # Extract just the tool parameters, not the LangChain wrapper
+                        if "properties" in schema and "args" in schema["properties"]:
+                            # This is the LangChain wrapper format
+                            args_schema = schema["properties"]["args"]
+                            if "items" in args_schema and isinstance(
+                                args_schema["items"], dict
+                            ):
+                                schema = args_schema["items"]
+
+                        # Ensure the schema has required fields for Claude
+                        if isinstance(schema, dict):
+                            if "type" not in schema:
+                                schema["type"] = "object"
+                            if "properties" not in schema:
+                                schema["properties"] = {}
+                            if "required" not in schema:
+                                schema["required"] = []
+                            claude_tool["input_schema"] = schema
+                except Exception as e:
+                    print(f"Warning: Could not extract schema for {tool.name}: {e}")
+
+            claude_tools.append(claude_tool)
+
+        return claude_tools
+
+    def get_available_tools(self) -> List[str]:
+        """Get list of available tool names."""
+        return [tool.name for tool in self.tools]
 
 
-def create_claude_jira_agent(**kwargs) -> ClaudeJiraAgent:
+async def create_simple_agent() -> SimpleAgent:
     """
-    Create a Claude Jira agent instance.
-    
-    Args:
-        **kwargs: Arguments to pass to ClaudeJiraAgent constructor
-        
-    Returns:
-        ClaudeJiraAgent: A new agent instance
+    Create and initialize a simple agent with default adapters.
+
+    This is a convenience function that automatically registers
+    the Atlassian adapter and initializes the agent.
     """
-    return ClaudeJiraAgent(**kwargs)
+    from .atlassian_mcp_adapter import create_atlassian_adapter
 
+    agent = SimpleAgent()
 
-# For backward compatibility with the old agent interface
-def create_jira_agent():
-    """Create a Jira agent instance (legacy compatibility)."""
-    return create_claude_jira_agent()
+    # Register default adapters
+    atlassian_adapter = create_atlassian_adapter()
+    agent.register_adapter(atlassian_adapter)
+
+    # You can easily add more adapters here:
+    # github_adapter = create_github_adapter()
+    # agent.register_adapter(github_adapter)
+
+    # Initialize agent with registered adapters
+    await agent.initialize()
+
+    return agent

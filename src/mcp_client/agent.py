@@ -1,297 +1,292 @@
 """
-Multi-MCP Server Agent with Atlassian Integration
+Simple Agent using MCP tools and Claude directly.
 
-Scalable agent architecture that can work with multiple MCP servers:
-- Generic MCP client framework
-- Server-specific adapters (Atlassian, future servers)
-- Clean separation between generic and server-specific functionality
-- Easy to extend with new MCP servers
+This agent dynamically gets tools from MCP servers and uses Claude
+to handle user queries without any server-specific code.
 """
 
-import asyncio
-from pathlib import Path
-from typing import Optional, List
-from dotenv import load_dotenv
+from typing import List
+import anthropic
 
-from .base_client import GenericMCPClient, BaseMCPServerAdapter
-from .atlassian_adapter import create_atlassian_adapter
+from .mcp_client import MCPClientManager
 
 
-# Load environment variables
-env_path = Path.cwd() / ".env"
-load_dotenv(dotenv_path=env_path)
-
-
-class MultiMCPAgent:
-    """
-    Multi-MCP Server Agent that can connect to multiple MCP servers.
-
-    This agent provides a unified interface to work with different MCP servers
-    through server-specific adapters. Currently supports:
-    - Atlassian MCP Server (Jira & Confluence)
-
-    Future servers can be easily added by creating new adapter classes.
-    """
+class SimpleAgent:
+    """Simple agent that uses Claude with dynamically fetched MCP tools."""
 
     def __init__(
-        self,
-        ai_model: str = "claude-3-5-sonnet-20241022",
-        temperature: float = 0,
-        verbose: bool = True,
-        mcp_verbose: bool = False,
-        adapters: Optional[List[BaseMCPServerAdapter]] = None,
+        self, model: str = "claude-3-5-sonnet-20241022", temperature: float = 0
     ):
+        self.anthropic_client = anthropic.Anthropic()
+        self.model = model
+        self.temperature = temperature
+        self.mcp_manager = MCPClientManager()
+        self.tools = []
+
+    async def initialize(self):
+        """Initialize the agent by fetching tools from MCP servers."""
+        # Fetch tools dynamically from all registered adapters
+        self.tools = await self.mcp_manager.get_tools()
+        print(f"🤖 Agent initialized with {len(self.tools)} tools")
+
+    def register_adapter(self, adapter):
+        """Register an MCP adapter."""
+        self.mcp_manager.register_adapter(adapter)
+
+    async def chat(self, query: str, system_prompt: str = None) -> str:
         """
-        Initialize the Multi-MCP Agent.
+        Process a user query using Claude with available tools.
 
         Args:
-            ai_model: Claude model to use for AI processing
-            temperature: Temperature for AI responses (0-1)
-            verbose: Whether to print debug information
-            mcp_verbose: Whether to show verbose MCP protocol output (False = quieter operation)
-            adapters: List of MCP server adapters to register. If None, defaults to Atlassian only.
-        """
-        self.verbose = verbose
-
-        # Initialize the generic MCP client with verbosity control
-        self.mcp_client = GenericMCPClient(
-            ai_model=ai_model,
-            temperature=temperature,
-            verbose=verbose,
-            mcp_verbose=mcp_verbose,
-        )
-
-        # Register MCP server adapters
-        self._register_adapters(adapters)
-
-        # Track initialization state
-        self._initialized = False
-
-    def _register_adapters(
-        self, adapters: Optional[List[BaseMCPServerAdapter]] = None
-    ) -> None:
-        """Register MCP server adapters."""
-        if adapters is None:
-            # Default to Atlassian adapter for backward compatibility
-            adapters = self._get_default_adapters()
-
-        for adapter in adapters:
-            try:
-                self.mcp_client.register_mcp_server(adapter)
-
-                if self.verbose:
-                    print(f"📋 Registered {adapter.config.name} MCP adapter")
-
-            except Exception as e:
-                if self.verbose:
-                    print(f"❌ Failed to register {adapter.config.name} adapter: {e}")
-
-    def _get_default_adapters(self) -> List[BaseMCPServerAdapter]:
-        """Get default adapters (for backward compatibility)."""
-        try:
-            atlassian_adapter = create_atlassian_adapter(
-                verbose=self.verbose, mcp_verbose=self.mcp_client.mcp_verbose
-            )
-            return [atlassian_adapter]
-        except Exception as e:
-            if self.verbose:
-                print(f"❌ Failed to create default Atlassian adapter: {e}")
-            return []
-
-    async def initialize_all_connections(self) -> bool:
-        """
-        Initialize connections to all registered MCP servers.
+            query: User's question or request
+            system_prompt: Optional system prompt to guide the agent
 
         Returns:
-            bool: True if at least one server connected successfully
+            Agent's response
         """
-        if self._initialized:
-            return True
+        if not self.tools:
+            await self.initialize()
 
         try:
-            if self.verbose:
-                print("🚀 Initializing Multi-MCP Agent...")
+            # Convert LangChain tools to Claude tool format
+            claude_tools = self._convert_tools_for_claude()
 
-            # Initialize all server connections
-            connection_results = await self.mcp_client.initialize_all_connections()
+            # Build system prompt
+            default_system = """You are a helpful assistant with access to various tools.
 
-            # Check if any connections succeeded
-            successful_connections = sum(
-                1 for success in connection_results.values() if success
+When you need to use a tool to answer the user's question, use the appropriate tool and provide a response based on the results.
+
+For Jira queries, be efficient:
+- ALWAYS start by getting the cloudId using Atlassian_getAccessibleAtlassianResources
+- Then use Atlassian_searchJiraIssuesUsingJql directly for ticket searches
+- Don't call Atlassian_atlassianUserInfo unless specifically asked for user information
+- For user's tickets: "assignee = currentUser() ORDER BY updated DESC"
+- For tickets they reported: "reporter = currentUser() ORDER BY created DESC" 
+- For recent tickets: "updated >= -7d ORDER BY updated DESC"
+
+Be helpful and provide clear, concise responses based on actual tool results."""
+
+            if system_prompt:
+                final_system = f"{system_prompt}\n\n{default_system}"
+            else:
+                final_system = default_system
+
+            # First call to Claude with tools
+            response = self.anthropic_client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                temperature=self.temperature,
+                system=final_system,
+                tools=claude_tools,
+                messages=[{"role": "user", "content": query}],
             )
-            total_servers = len(connection_results)
 
-            if successful_connections > 0:
-                self._initialized = True
-                if self.verbose:
-                    print(
-                        f"✅ Multi-MCP Agent ready! ({successful_connections}/{total_servers} servers connected)"
+            # Check if Claude wants to use tools
+            if response.stop_reason == "tool_use":
+                return await self._handle_tool_calls(response, query, final_system)
+            else:
+                # Find the text content in the response
+                for content_block in response.content:
+                    if content_block.type == "text":
+                        return content_block.text
+                return "No text response found"
+
+        except Exception as e:
+            return f"Error processing query: {str(e)}"
+
+    async def _handle_tool_calls(
+        self, response, original_query: str, system_prompt: str
+    ) -> str:
+        """Handle tool calls from Claude, including chained tool calls."""
+        messages = [{"role": "user", "content": original_query}]
+
+        current_response = response
+        max_iterations = 3  # Reduced from 5 to save API calls
+        iteration = 0
+
+        while current_response.stop_reason == "tool_use" and iteration < max_iterations:
+            iteration += 1
+            print(f"🔧 Tool call iteration {iteration}")
+
+            # Add Claude's response with tool calls
+            claude_content = []
+            for content_block in current_response.content:
+                if content_block.type == "text":
+                    claude_content.append({"type": "text", "text": content_block.text})
+                elif content_block.type == "tool_use":
+                    claude_content.append(
+                        {
+                            "type": "tool_use",
+                            "id": content_block.id,
+                            "name": content_block.name,
+                            "input": content_block.input,
+                        }
                     )
-                return True
-            else:
-                if self.verbose:
-                    print("❌ No MCP servers connected successfully")
-                return False
 
-        except Exception as e:
-            if self.verbose:
-                print(f"❌ Failed to initialize MCP connections: {e}")
-            return False
+            messages.append({"role": "assistant", "content": claude_content})
 
-    async def chat(self, query: str) -> str:
-        """
-        Process a user query across all connected MCP servers.
+            # Execute tools and add results
+            for content_block in current_response.content:
+                if content_block.type == "tool_use":
+                    try:
+                        # Find the tool and execute it
+                        tool_name = content_block.name
+                        tool_input = content_block.input
+                        print(
+                            f"🔧 Executing tool: {tool_name} with input: {tool_input}"
+                        )
 
-        Args:
-            query: The user's question or request
+                        # Find the tool in our tools list
+                        tool = next(
+                            (t for t in self.tools if t.name == tool_name), None
+                        )
+                        if tool:
+                            # Execute tool using standard LangChain interface
+                            result = await tool.ainvoke(tool_input)
+                            print(f"✅ Tool result length: {len(str(result))}")
 
-        Returns:
-            str: The agent's response combining results from relevant servers
-        """
-        try:
-            # Ensure connections are initialized
-            if not self._initialized:
-                success = await self.initialize_all_connections()
-                if not success:
-                    return "❌ No MCP servers are available. Please check your configuration."
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": content_block.id,
+                                            "content": str(result),
+                                        }
+                                    ],
+                                }
+                            )
+                        else:
+                            print(f"❌ Tool not found: {tool_name}")
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": content_block.id,
+                                            "content": f"Tool {tool_name} not found",
+                                        }
+                                    ],
+                                }
+                            )
+                    except Exception as e:
+                        print(f"❌ Tool execution error: {e}")
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": content_block.id,
+                                        "content": f"Error executing tool: {str(e)}",
+                                    }
+                                ],
+                            }
+                        )
 
-            # Execute query across relevant servers
-            return await self.mcp_client.execute_multi_server_query(query)
+            # Get next response from Claude
+            print(f"📤 Sending {len(messages)} messages to Claude")
+            current_response = self.anthropic_client.messages.create(
+                model=self.model,
+                max_tokens=1000,
+                temperature=self.temperature,
+                system=system_prompt,
+                tools=self._convert_tools_for_claude(),
+                messages=messages,
+            )
+            print(f"📥 Got response with stop_reason: {current_response.stop_reason}")
 
-        except Exception as e:
-            error_msg = f"❌ Error processing query: {str(e)}"
-            if self.verbose:
-                print(error_msg)
-            return error_msg
+        # Find the text content in the final response
+        for content_block in current_response.content:
+            if content_block.type == "text":
+                return content_block.text
 
-    def chat_sync(self, query: str) -> str:
-        """
-        Synchronous wrapper for the async chat method.
+        return "No text response found in final response"
 
-        Args:
-            query: The user's question or request
+    def _convert_tools_for_claude(self) -> List[dict]:
+        """Convert LangChain tools to Claude tool format."""
+        claude_tools = []
+        for tool in self.tools:
+            claude_tool = {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": {"type": "object", "properties": {}, "required": []},
+            }
 
-        Returns:
-            str: The agent's response
-        """
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # If we're already in an event loop, we need to handle this differently
-                import concurrent.futures
+            # Try to extract schema from the tool if available
+            if hasattr(tool, "args_schema") and tool.args_schema:
+                # Convert Pydantic schema to JSON schema
+                schema = tool.args_schema.model_json_schema()
+                # Ensure the schema has required fields for Claude
+                if isinstance(schema, dict):
+                    # Make sure it has type: object
+                    if "type" not in schema:
+                        schema["type"] = "object"
+                    # Make sure it has properties
+                    if "properties" not in schema:
+                        schema["properties"] = {}
+                    # Make sure it has required array
+                    if "required" not in schema:
+                        schema["required"] = []
+                    claude_tool["input_schema"] = schema
+            elif hasattr(tool, "get_input_schema"):
+                # Alternative: use get_input_schema method
+                try:
+                    schema_class = tool.get_input_schema()
+                    if schema_class and hasattr(schema_class, "model_json_schema"):
+                        schema = schema_class.model_json_schema()
+                        # Extract just the tool parameters, not the LangChain wrapper
+                        if "properties" in schema and "args" in schema["properties"]:
+                            # This is the LangChain wrapper format
+                            args_schema = schema["properties"]["args"]
+                            if "items" in args_schema and isinstance(
+                                args_schema["items"], dict
+                            ):
+                                schema = args_schema["items"]
 
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, self.chat(query))
-                    return future.result()
-            else:
-                return asyncio.run(self.chat(query))
-        except RuntimeError:
-            # Fallback for event loop issues
-            return asyncio.run(self.chat(query))
+                        # Ensure the schema has required fields for Claude
+                        if isinstance(schema, dict):
+                            if "type" not in schema:
+                                schema["type"] = "object"
+                            if "properties" not in schema:
+                                schema["properties"] = {}
+                            if "required" not in schema:
+                                schema["required"] = []
+                            claude_tool["input_schema"] = schema
+                except Exception as e:
+                    print(f"Warning: Could not extract schema for {tool.name}: {e}")
 
-    def add_mcp_server_adapter(self, adapter) -> None:
-        """
-        Add a custom MCP server adapter.
+            claude_tools.append(claude_tool)
 
-        Args:
-            adapter: An instance of BaseMCPServerAdapter or its subclass
-        """
-        self.mcp_client.register_mcp_server(adapter)
-        # Reset initialization to force reconnection
-        self._initialized = False
+        return claude_tools
 
-    def get_connected_servers(self) -> list:
-        """Get list of connected MCP server names."""
-        return list(self.mcp_client.server_adapters.keys())
-
-    async def get_all_capabilities(self) -> str:
-        """Get capabilities summary from all connected servers."""
-        return await self.mcp_client._format_all_capabilities()
+    def get_available_tools(self) -> List[str]:
+        """Get list of available tool names."""
+        return [tool.name for tool in self.tools]
 
 
-# Backward compatibility classes and functions
-class ClaudeJiraAgent(MultiMCPAgent):
+async def create_simple_agent() -> SimpleAgent:
     """
-    Backward compatibility class for ClaudeJiraAgent.
+    Create and initialize a simple agent with default adapters.
 
-    This is now a specialized version of MultiMCPAgent that focuses on Atlassian.
+    This is a convenience function that automatically registers
+    the Atlassian adapter and initializes the agent.
     """
+    from .atlassian_mcp_adapter import create_atlassian_adapter
 
-    def __init__(self, **kwargs):
-        # Ensure Atlassian adapter is included for backward compatibility
-        if "adapters" not in kwargs:
-            kwargs["adapters"] = None  # Will use default adapters (Atlassian)
-        super().__init__(**kwargs)
+    agent = SimpleAgent()
 
-    async def run(self, query: str) -> str:
-        """Backward compatibility method."""
-        return await self.chat(query)
+    # Register default adapters
+    atlassian_adapter = create_atlassian_adapter()
+    agent.register_adapter(atlassian_adapter)
 
-    def run_sync(self, query: str) -> str:
-        """Backward compatibility method."""
-        return self.chat_sync(query)
+    # You can easily add more adapters here:
+    # github_adapter = create_github_adapter()
+    # agent.register_adapter(github_adapter)
 
+    # Initialize agent with registered adapters
+    await agent.initialize()
 
-def create_multi_mcp_agent(**kwargs) -> MultiMCPAgent:
-    """
-    Create a Multi-MCP agent instance.
-
-    Args:
-        **kwargs: Arguments to pass to MultiMCPAgent constructor
-
-    Returns:
-        MultiMCPAgent: A new agent instance
-    """
-    return MultiMCPAgent(**kwargs)
-
-
-def create_claude_jira_agent(**kwargs) -> ClaudeJiraAgent:
-    """
-    Create a Claude Jira agent instance (backward compatibility).
-
-    Args:
-        **kwargs: Arguments to pass to ClaudeJiraAgent constructor
-
-    Returns:
-        ClaudeJiraAgent: A new agent instance focused on Atlassian
-    """
-    return ClaudeJiraAgent(**kwargs)
-
-
-def create_jira_agent(**kwargs):
-    """Create a Jira agent instance (legacy compatibility)."""
-    return create_claude_jira_agent(**kwargs)
-
-
-# Example of how to add new MCP servers:
-#
-# from .github_adapter import create_github_adapter
-# from .slack_adapter import create_slack_adapter
-#
-# # Create individual adapters
-# github_adapter = create_github_adapter()
-# slack_adapter = create_slack_adapter()
-# atlassian_adapter = create_atlassian_adapter()
-#
-# # Create agent with multiple adapters
-# agent = MultiMCPAgent(
-#     adapters=[atlassian_adapter, github_adapter, slack_adapter],
-#     verbose=True
-# )
-#
-# # Or extend the agent class for convenience
-# class ExtendedMultiMCPAgent(MultiMCPAgent):
-#     def __init__(self, enable_github=False, enable_slack=False, **kwargs):
-#         adapters = []
-#
-#         # Always include Atlassian by default
-#         adapters.append(create_atlassian_adapter())
-#
-#         if enable_github:
-#             adapters.append(create_github_adapter())
-#
-#         if enable_slack:
-#             adapters.append(create_slack_adapter())
-#
-#         kwargs['adapters'] = adapters
-#         super().__init__(**kwargs)
+    return agent

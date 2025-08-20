@@ -101,7 +101,7 @@ class MCPServerAdapter(ABC):
             # Ensure we have a persistent session
             await self._establish_session()
 
-            print(f"🔍 Executing {tool_name} with args: {tool_args}")
+            # print(f"🔍 Executing {tool_name} with args: {tool_args}")
 
             # Execute the tool using persistent session
             result = await self._session.call_tool(tool_name, tool_args)

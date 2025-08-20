@@ -19,19 +19,10 @@ sys.path.insert(0, str(project_root))
 
 async def main():
     """Interactive chat interface with the generic MCP agent."""
-
-    print("🚀 Starting Simple MCP Agent Chat Interface...")
-    print("Creating agent and fetching tools...")
-
+    agent = None
     try:
-        # Create and initialize the agent
+        print("🚀 Starting Simple MCP Agent Chat Interface...")
         agent = await create_simple_agent()
-
-        print(f"✅ Agent ready with {len(agent.tools)} tools!")
-        print("=" * 50)
-        print("🤖 Simple MCP Agent Chat")
-        print("Type your questions (or 'quit' to exit):")
-        print("=" * 50)
 
         # Interactive chat loop
         while True:
@@ -60,6 +51,13 @@ async def main():
                 break
             except Exception as e:
                 print(f"❌ Error processing query: {e}")
+            finally:
+                # Clean shutdown
+                if agent and hasattr(agent, 'mcp_manager'):
+                    try:
+                        await agent.mcp_manager.cleanup()
+                    except:
+                        pass
 
     except Exception as e:
         print(f"❌ Failed to initialize agent: {e}")
